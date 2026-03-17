@@ -41,30 +41,42 @@ interface Task {
   title: string;
   assigned_to: string;
   deadline: string;
+  priority: 'Low' | 'Medium' | 'High';
   status: 'Pending' | 'Completed';
   notes: string;
   created_at: string;
 }
 
+interface Meeting {
+  id: number;
+  filename: string;
+  transcript: string;
+  summary: string;
+  created_at: string;
+}
+
 interface AIResult {
+  transcript: string;
+  summary: string;
   tasks: {
     task: string;
     assigned_to: string;
     deadline: string;
+    priority: 'Low' | 'Medium' | 'High';
     notes: string;
   }[];
-  transcript: string;
 }
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [latestMeeting, setLatestMeeting] = useState<Meeting | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [transcript, setTranscript] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'All' | 'Pending' | 'Completed'>('All');
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [showNotification, setShowNotification] = useState<{message: string, type: 'success' | 'info'} | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Initialize Gemini
@@ -72,19 +84,18 @@ export default function App() {
 
   useEffect(() => {
     fetchTasks();
-    // Check system preference for dark mode
+    fetchLatestMeeting();
     if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
       setIsDarkMode(true);
     }
   }, []);
 
   useEffect(() => {
-    if (isDarkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
+    if (showNotification) {
+      const timer = setTimeout(() => setShowNotification(null), 4000);
+      return () => clearTimeout(timer);
     }
-  }, [isDarkMode]);
+  }, [showNotification]);
 
   const fetchTasks = async () => {
     try {
@@ -96,6 +107,16 @@ export default function App() {
     }
   };
 
+  const fetchLatestMeeting = async () => {
+    try {
+      const response = await fetch('/api/meetings/latest');
+      const data = await response.json();
+      setLatestMeeting(data);
+    } catch (error) {
+      console.error('Error fetching meeting:', error);
+    }
+  };
+
   const handleFileUpload = async (file: File) => {
     if (!file) return;
     
@@ -103,7 +124,6 @@ export default function App() {
     setIsProcessing(true);
     
     try {
-      // 1. Upload file to server
       const formData = new FormData();
       formData.append('audio', file);
       
@@ -115,8 +135,6 @@ export default function App() {
       if (!uploadRes.ok) throw new Error('Upload failed');
       const uploadData = await uploadRes.json();
 
-      // 2. Process with AI
-      // Convert file to base64 for Gemini
       const reader = new FileReader();
       reader.readAsDataURL(file);
       reader.onloadend = async () => {
@@ -124,7 +142,7 @@ export default function App() {
         
         try {
           const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-native-audio-preview-12-2025",
+            model: "gemini-3-flash-preview",
             contents: [
               {
                 parts: [
@@ -135,13 +153,22 @@ export default function App() {
                     }
                   },
                   {
-                    text: `Transcribe this meeting audio and extract actionable tasks. 
+                    text: `Transcribe this meeting audio and extract every single actionable task, assignment, and deadline mentioned. 
+                    
+                    CRITICAL INSTRUCTIONS:
+                    1. Identify the person assigned to each task. Look for phrases like "I will...", "Can you...", "[Name] should...", etc.
+                    2. If a task is mentioned but no one is explicitly assigned, try to infer the owner from context or use "General/Team".
+                    3. Extract deadlines even if they are vague (e.g., "by end of week").
+                    4. Provide a concise summary of the meeting.
+                    
                     Return a JSON object with:
                     - transcript: the full transcription
-                    - tasks: an array of objects with { task, assigned_to, deadline, notes }.
+                    - summary: a concise 3-4 sentence summary of the meeting highlights
+                    - tasks: an array of objects with { task, assigned_to, deadline, priority, notes }.
                     
-                    For deadlines, convert natural language (e.g., "tomorrow", "next Friday") into YYYY-MM-DD format based on today's date: ${new Date().toISOString().split('T')[0]}.
-                    If assigned_to or deadline is missing, use "Unknown".`
+                    For priority, choose from "Low", "Medium", or "High" based on the urgency discussed.
+                    For deadlines, convert natural language into YYYY-MM-DD format based on today's date: ${new Date().toISOString().split('T')[0]}.
+                    If deadline is missing, use "Unknown".`
                   }
                 ]
               }
@@ -152,6 +179,7 @@ export default function App() {
                 type: Type.OBJECT,
                 properties: {
                   transcript: { type: Type.STRING },
+                  summary: { type: Type.STRING },
                   tasks: {
                     type: Type.ARRAY,
                     items: {
@@ -160,50 +188,105 @@ export default function App() {
                         task: { type: Type.STRING },
                         assigned_to: { type: Type.STRING },
                         deadline: { type: Type.STRING },
+                        priority: { type: Type.STRING, enum: ["Low", "Medium", "High"] },
                         notes: { type: Type.STRING }
                       },
-                      required: ["task", "assigned_to", "deadline", "notes"]
+                      required: ["task", "assigned_to", "deadline", "priority", "notes"]
                     }
                   }
                 },
-                required: ["transcript", "tasks"]
+                required: ["transcript", "summary", "tasks"]
               }
             }
           });
 
-          const result: AIResult = JSON.parse(response.text || '{}');
-          setTranscript(result.transcript);
+          const resultText = response.text;
+          if (!resultText) throw new Error("AI returned empty response");
+          
+          const result: AIResult = JSON.parse(resultText);
+          
+          // Save meeting
+          const meetingRes = await fetch('/api/meetings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              filename: uploadData.filename,
+              transcript: result.transcript,
+              summary: result.summary
+            }),
+          });
+          const meetingData = await meetingRes.json();
 
-          // 3. Save tasks to DB
-          for (const taskData of result.tasks) {
-            await fetch('/api/tasks', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                title: taskData.task,
-                assigned_to: taskData.assigned_to,
-                deadline: taskData.deadline,
-                notes: taskData.notes
-              }),
-            });
-            // Simulate email reminder
-            console.log(`[SIMULATED EMAIL] To: ${taskData.assigned_to}, Subject: New Task Assigned - ${taskData.task}, Body: You have a new task due by ${taskData.deadline}. Notes: ${taskData.notes}`);
+          // Save tasks sequentially to ensure they are all processed
+          if (result.tasks && result.tasks.length > 0) {
+            for (const taskData of result.tasks) {
+              await fetch('/api/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  title: taskData.task,
+                  assigned_to: taskData.assigned_to,
+                  deadline: taskData.deadline,
+                  priority: taskData.priority,
+                  notes: taskData.notes,
+                  meeting_id: meetingData.id
+                }),
+              });
+            }
+            setShowNotification({ message: `Successfully extracted ${result.tasks.length} tasks!`, type: 'success' });
+          } else {
+            setShowNotification({ message: "Meeting processed, but no specific tasks were identified.", type: 'info' });
           }
 
           fetchTasks();
+          fetchLatestMeeting();
           setIsProcessing(false);
           setIsUploading(false);
         } catch (error) {
           console.error('AI Processing error:', error);
+          setShowNotification({ message: "Error processing meeting audio. Please try again.", type: 'info' });
           setIsProcessing(false);
           setIsUploading(false);
         }
       };
     } catch (error) {
       console.error('Upload error:', error);
+      setShowNotification({ message: "Failed to upload audio file.", type: 'info' });
       setIsUploading(false);
       setIsProcessing(false);
     }
+  };
+
+  const sendSimulatedEmail = (task: Task) => {
+    console.log(`[SIMULATED EMAIL] To: ${task.assigned_to}, Subject: Reminder - ${task.title}, Body: This is a reminder for your task due on ${task.deadline}.`);
+    setShowNotification({ message: `Reminder email sent to ${task.assigned_to}!`, type: 'info' });
+  };
+
+  const getDeadlineStatus = (deadline: string) => {
+    if (deadline === 'Unknown') return null;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const dueDate = new Date(deadline);
+    dueDate.setHours(0, 0, 0, 0);
+
+    if (dueDate < today) return 'Overdue';
+    if (dueDate.getTime() === today.getTime()) return 'Due Today';
+    const diffTime = dueDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    if (diffDays <= 3) return 'Upcoming';
+    return null;
+  };
+
+  const priorityColors = {
+    High: "text-rose-500 bg-rose-500/10 border-rose-500/20",
+    Medium: "text-amber-500 bg-amber-500/10 border-amber-500/20",
+    Low: "text-emerald-500 bg-emerald-500/10 border-emerald-500/20"
+  };
+
+  const deadlineStatusColors = {
+    'Overdue': "text-rose-600 bg-rose-100 dark:bg-rose-900/30 dark:text-rose-400",
+    'Due Today': "text-amber-600 bg-amber-100 dark:bg-amber-900/30 dark:text-amber-400",
+    'Upcoming': "text-blue-600 bg-blue-100 dark:bg-blue-900/30 dark:text-blue-400"
   };
 
   const toggleTaskStatus = async (id: number) => {
@@ -273,6 +356,24 @@ export default function App() {
       "min-h-screen transition-colors duration-300",
       isDarkMode ? "bg-[#0a0a0a] text-white" : "bg-[#f8f9fa] text-slate-900"
     )}>
+      {/* Notifications */}
+      <AnimatePresence>
+        {showNotification && (
+          <motion.div
+            initial={{ opacity: 0, y: -50 }}
+            animate={{ opacity: 1, y: 20 }}
+            exit={{ opacity: 0, y: -50 }}
+            className={cn(
+              "fixed top-0 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border",
+              showNotification.type === 'success' ? "bg-emerald-500 text-white border-emerald-400" : "bg-indigo-500 text-white border-indigo-400"
+            )}
+          >
+            {showNotification.type === 'success' ? <CheckCircle2 size={20} /> : <FileText size={20} />}
+            <span className="font-medium">{showNotification.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Navigation */}
       <nav className={cn(
         "sticky top-0 z-50 backdrop-blur-md border-b px-6 py-4 flex items-center justify-between",
@@ -422,8 +523,27 @@ export default function App() {
               )}
             </section>
 
+            {latestMeeting && (
+              <motion.section 
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className={cn(
+                  "p-6 rounded-2xl border",
+                  isDarkMode ? "bg-indigo-900/20 border-indigo-500/30" : "bg-indigo-50 border-indigo-100 shadow-sm"
+                )}
+              >
+                <h2 className="text-lg font-semibold mb-3 flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
+                  <BarChart3 size={20} />
+                  Meeting Summary
+                </h2>
+                <p className="text-sm leading-relaxed text-slate-600 dark:text-slate-300 italic">
+                  {latestMeeting.summary}
+                </p>
+              </motion.section>
+            )}
+
             <section className={cn(
-              "p-6 rounded-2xl border h-[400px] flex flex-col",
+              "p-6 rounded-2xl border h-[300px] flex flex-col",
               isDarkMode ? "bg-zinc-900/50 border-white/10" : "bg-white border-black/5 shadow-sm"
             )}>
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
@@ -431,9 +551,9 @@ export default function App() {
                 Transcript Viewer
               </h2>
               <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
-                {transcript ? (
+                {latestMeeting?.transcript ? (
                   <p className="text-sm leading-relaxed text-slate-600 dark:text-slate-400 whitespace-pre-wrap">
-                    {transcript}
+                    {latestMeeting.transcript}
                   </p>
                 ) : (
                   <div className="h-full flex flex-col items-center justify-center text-slate-400 text-center">
@@ -492,88 +612,119 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <AnimatePresence mode="popLayout">
                 {filteredTasks.length > 0 ? (
-                  filteredTasks.map((task) => (
-                    <motion.div
-                      key={task.id}
-                      layout
-                      initial={{ opacity: 0, scale: 0.95 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={{ opacity: 0, scale: 0.95 }}
-                      className={cn(
-                        "p-5 rounded-2xl border group relative transition-all",
-                        isDarkMode ? "bg-zinc-900/50 border-white/10" : "bg-white border-black/5 shadow-sm",
-                        task.status === 'Completed' && "opacity-75"
-                      )}
-                    >
-                      <div className="flex justify-between items-start mb-3">
-                        <div className={cn(
-                          "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider",
-                          task.status === 'Completed' 
-                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" 
-                            : "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                        )}>
-                          {task.status}
-                        </div>
-                        <button 
-                          onClick={() => deleteTask(task.id)}
-                          className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-red-500 transition-all"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-
-                      <h3 className={cn(
-                        "font-semibold text-lg mb-4 line-clamp-2",
-                        task.status === 'Completed' && "line-through text-slate-500"
-                      )}>
-                        {task.title}
-                      </h3>
-
-                      <div className="space-y-2 mb-6">
-                        <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
-                          <User size={14} className="text-indigo-500" />
-                          <span className="font-medium text-slate-700 dark:text-slate-300">
-                            {task.assigned_to === 'Unknown' ? (
-                              <span className="text-red-400 italic">Unassigned</span>
-                            ) : task.assigned_to}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
-                          <Calendar size={14} className="text-indigo-500" />
-                          <span className={cn(
-                            task.deadline === 'Unknown' && "text-red-400 italic"
-                          )}>
-                            {task.deadline === 'Unknown' ? 'No Deadline' : task.deadline}
-                          </span>
-                        </div>
-                      </div>
-
-                      {task.notes && task.notes !== 'Unknown' && (
-                        <div className="mb-6 p-3 rounded-xl bg-slate-50 dark:bg-zinc-800/50 text-xs text-slate-500 dark:text-slate-400 italic">
-                          "{task.notes}"
-                        </div>
-                      )}
-
-                      <button
-                        onClick={() => toggleTaskStatus(task.id)}
+                  filteredTasks.map((task) => {
+                    const dlStatus = getDeadlineStatus(task.deadline);
+                    return (
+                      <motion.div
+                        key={task.id}
+                        layout
+                        initial={{ opacity: 0, scale: 0.95 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
                         className={cn(
-                          "w-full py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                          task.status === 'Completed'
-                            ? "bg-slate-100 dark:bg-zinc-800 text-slate-500 hover:bg-slate-200 dark:hover:bg-zinc-700"
-                            : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-500/20"
+                          "p-5 rounded-2xl border group relative transition-all",
+                          isDarkMode ? "bg-zinc-900/50 border-white/10" : "bg-white border-black/5 shadow-sm",
+                          task.status === 'Completed' && "opacity-75"
                         )}
                       >
-                        {task.status === 'Completed' ? (
-                          <>Reopen Task</>
-                        ) : (
-                          <>
-                            <CheckCircle2 size={18} />
-                            Mark as Complete
-                          </>
+                        <div className="flex justify-between items-start mb-3">
+                          <div className="flex gap-2">
+                            <div className={cn(
+                              "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider",
+                              task.status === 'Completed' 
+                                ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" 
+                                : "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                            )}>
+                              {task.status}
+                            </div>
+                            <div className={cn(
+                              "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border",
+                              priorityColors[task.priority]
+                            )}>
+                              {task.priority}
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => deleteTask(task.id)}
+                            className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-red-500 transition-all"
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+
+                        <h3 className={cn(
+                          "font-semibold text-lg mb-4 line-clamp-2",
+                          task.status === 'Completed' && "line-through text-slate-500"
+                        )}>
+                          {task.title}
+                        </h3>
+
+                        <div className="space-y-2 mb-6">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
+                              <User size={14} className="text-indigo-500" />
+                              <span className="font-medium text-slate-700 dark:text-slate-300">
+                                {task.assigned_to === 'Unknown' ? (
+                                  <span className="text-red-400 italic">Unassigned</span>
+                                ) : task.assigned_to}
+                              </span>
+                            </div>
+                            {task.assigned_to !== 'Unknown' && (
+                              <button 
+                                onClick={() => sendSimulatedEmail(task)}
+                                className="text-[10px] font-bold text-indigo-500 hover:underline uppercase"
+                              >
+                                Send Reminder
+                              </button>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
+                              <Calendar size={14} className="text-indigo-500" />
+                              <span className={cn(
+                                task.deadline === 'Unknown' && "text-red-400 italic"
+                              )}>
+                                {task.deadline === 'Unknown' ? 'No Deadline' : task.deadline}
+                              </span>
+                            </div>
+                            {dlStatus && task.status === 'Pending' && (
+                              <div className={cn(
+                                "px-2 py-0.5 rounded-md text-[9px] font-bold uppercase",
+                                deadlineStatusColors[dlStatus]
+                              )}>
+                                {dlStatus}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {task.notes && task.notes !== 'Unknown' && (
+                          <div className="mb-6 p-3 rounded-xl bg-slate-50 dark:bg-zinc-800/50 text-xs text-slate-500 dark:text-slate-400 italic">
+                            "{task.notes}"
+                          </div>
                         )}
-                      </button>
-                    </motion.div>
-                  ))
+
+                        <button
+                          onClick={() => toggleTaskStatus(task.id)}
+                          className={cn(
+                            "w-full py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
+                            task.status === 'Completed'
+                              ? "bg-slate-100 dark:bg-zinc-800 text-slate-500 hover:bg-slate-200 dark:hover:bg-zinc-700"
+                              : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-500/20"
+                          )}
+                        >
+                          {task.status === 'Completed' ? (
+                            <>Reopen Task</>
+                          ) : (
+                            <>
+                              <CheckCircle2 size={18} />
+                              Mark as Complete
+                            </>
+                          )}
+                        </button>
+                      </motion.div>
+                    );
+                  })
                 ) : (
                   <div className="col-span-full py-20 flex flex-col items-center justify-center text-slate-400">
                     <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-zinc-900 flex items-center justify-center mb-4">
@@ -591,7 +742,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="max-w-7xl mx-auto p-6 mt-12 border-t border-black/5 dark:border-white/10 text-center text-slate-500 text-sm">
-        <p>© 2026 MeetingAI Assistant. Built with Gemini 2.5 Flash.</p>
+        <p>© 2026 MeetingAI Assistant. Built with Gemini 3 Flash.</p>
       </footer>
     </div>
   );
