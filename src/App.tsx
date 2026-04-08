@@ -86,6 +86,7 @@ export default function App() {
   const [latestMeeting, setLatestMeeting] = useState<Meeting | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'All' | 'Pending' | 'Completed'>('All');
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -99,6 +100,7 @@ export default function App() {
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showHistoryClearConfirm, setShowHistoryClearConfirm] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Initialize Gemini
@@ -155,21 +157,40 @@ export default function App() {
     
     setIsUploading(true);
     setIsProcessing(true);
+    setProcessingStatus('Uploading file...');
     
     try {
+      let fileToProcess = file;
+      let mimeType = file.type;
+
+      // If it's a video, extract audio client-side to save bandwidth and stay within AI limits
+      if (file.type.startsWith('video/')) {
+        setProcessingStatus('Extracting audio from video...');
+        try {
+          fileToProcess = await extractAudio(file);
+          mimeType = 'audio/wav';
+        } catch (err) {
+          console.error('Audio extraction failed, trying original file:', err);
+          // Fallback to original file if extraction fails
+        }
+      }
+
       const formData = new FormData();
-      formData.append('audio', file);
+      formData.append('audio', fileToProcess);
       
       const uploadRes = await fetch('/api/upload', {
         method: 'POST',
         body: formData,
       });
       
-      if (!uploadRes.ok) throw new Error('Upload failed');
       const uploadData = await uploadRes.json();
+      if (!uploadRes.ok) {
+        throw new Error(uploadData.error || 'Upload failed');
+      }
 
+      setProcessingStatus('Analyzing with AI...');
       const reader = new FileReader();
-      reader.readAsDataURL(file);
+      reader.readAsDataURL(fileToProcess);
       reader.onloadend = async () => {
         const base64Data = (reader.result as string).split(',')[1];
         
@@ -181,18 +202,19 @@ export default function App() {
                 parts: [
                   {
                     inlineData: {
-                      mimeType: file.type,
+                      mimeType: mimeType,
                       data: base64Data
                     }
                   },
                   {
-                    text: `Transcribe this meeting audio and extract every single actionable task, assignment, and deadline mentioned. 
+                    text: `Analyze this meeting ${file.type.startsWith('video/') ? 'video (audio track)' : 'audio'} and extract every single actionable task, assignment, and deadline mentioned. 
                     
                     CRITICAL INSTRUCTIONS:
                     1. Identify the person assigned to each task. Look for phrases like "I will...", "Can you...", "[Name] should...", etc.
                     2. If a task is mentioned but no one is explicitly assigned, try to infer the owner from context or use "General/Team".
-                    3. Extract deadlines even if they are vague (e.g., "by end of week").
+                    3. Extract deadlines even if they are vague (e.g., "by end of week", "next Monday").
                     4. Provide a concise summary of the meeting.
+                    5. For scheduling: If a specific time or date is mentioned, ensure it is captured accurately in the deadline field.
                     
                     Return a JSON object with:
                     - transcript: the full transcription
@@ -286,11 +308,90 @@ export default function App() {
           setIsUploading(false);
         }
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('Upload error:', error);
-      setShowNotification({ message: "Failed to upload audio file.", type: 'info' });
+      setShowNotification({ 
+        message: error.message || "Failed to upload audio file.", 
+        type: 'info' 
+      });
       setIsUploading(false);
       setIsProcessing(false);
+    }
+  };
+
+  const extractAudio = async (videoFile: File): Promise<File> => {
+    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const arrayBuffer = await videoFile.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    
+    const offlineContext = new OfflineAudioContext(
+      audioBuffer.numberOfChannels,
+      audioBuffer.length,
+      audioBuffer.sampleRate
+    );
+    
+    const source = offlineContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineContext.destination);
+    source.start();
+    
+    const renderedBuffer = await offlineContext.startRendering();
+    const wavBlob = bufferToWav(renderedBuffer);
+    return new File([wavBlob], 'extracted_audio.wav', { type: 'audio/wav' });
+  };
+
+  const bufferToWav = (buffer: AudioBuffer) => {
+    const numOfChan = buffer.numberOfChannels;
+    const length = buffer.length * numOfChan * 2 + 44;
+    const bufferArr = new ArrayBuffer(length);
+    const view = new DataView(bufferArr);
+    const channels = [];
+    let i;
+    let sample;
+    let offset = 0;
+    let pos = 0;
+
+    // write WAVE header
+    setUint32(0x46464952);                         // "RIFF"
+    setUint32(length - 8);                         // file length - 8
+    setUint32(0x45564157);                         // "WAVE"
+
+    setUint32(0x20746d66);                         // "fmt " chunk
+    setUint32(16);                                 // length = 16
+    setUint16(1);                                  // PCM (uncompressed)
+    setUint16(numOfChan);
+    setUint32(buffer.sampleRate);
+    setUint32(buffer.sampleRate * 2 * numOfChan);  // avg. bytes/sec
+    setUint16(numOfChan * 2);                      // block-align
+    setUint16(16);                                 // 16-bit (hardcoded)
+
+    setUint32(0x61746164);                         // "data" - chunk
+    setUint32(length - pos - 4);                   // chunk length
+
+    // write interleaved data
+    for(i = 0; i < buffer.numberOfChannels; i++)
+      channels.push(buffer.getChannelData(i));
+
+    while(pos < length) {
+      for(i = 0; i < numOfChan; i++) {             // interleave channels
+        sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
+        sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF); // scale to 16-bit signed int
+        view.setInt16(pos, sample, true);          // write 16-bit sample
+        pos += 2;
+      }
+      offset++;                                     // next source sample
+    }
+
+    return new Blob([bufferArr], {type: 'audio/wav'});
+
+    function setUint16(data: number) {
+      view.setUint16(pos, data, true);
+      pos += 2;
+    }
+
+    function setUint32(data: number) {
+      view.setUint32(pos, data, true);
+      pos += 4;
     }
   };
 
@@ -428,6 +529,31 @@ MeetingAI Assistant
       setShowClearConfirm(false);
     } catch (error) {
       console.error('Error clearing tasks:', error);
+    }
+  };
+
+  const deleteMeeting = async (id: number) => {
+    try {
+      await fetch(`/api/meetings/${id}`, { method: 'DELETE' });
+      fetchMeetings();
+      fetchTasks();
+      fetchLatestMeeting();
+      setShowNotification({ message: "Meeting deleted", type: 'info' });
+    } catch (error) {
+      console.error('Error deleting meeting:', error);
+    }
+  };
+
+  const clearAllMeetings = async () => {
+    try {
+      await fetch('/api/meetings', { method: 'DELETE' });
+      fetchMeetings();
+      fetchTasks();
+      setLatestMeeting(null);
+      setShowNotification({ message: "All meeting history cleared", type: 'info' });
+      setShowHistoryClearConfirm(false);
+    } catch (error) {
+      console.error('Error clearing history:', error);
     }
   };
 
@@ -648,12 +774,21 @@ MeetingAI Assistant
                   <p className="text-slate-500 text-sm">Review past transcripts and summaries</p>
                 </div>
               </div>
-              <button
-                onClick={() => setShowHistory(false)}
-                className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 font-medium hover:bg-slate-200 dark:hover:bg-zinc-700 transition-all"
-              >
-                Back to Dashboard
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setShowHistoryClearConfirm(true)}
+                  className="px-4 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 font-bold text-sm hover:bg-red-100 dark:hover:bg-red-900/40 transition-all flex items-center gap-2"
+                >
+                  <Trash size={18} />
+                  Clear All History
+                </button>
+                <button
+                  onClick={() => setShowHistory(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 font-medium hover:bg-slate-200 dark:hover:bg-zinc-700 transition-all"
+                >
+                  Back to Dashboard
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-4">
@@ -671,6 +806,13 @@ MeetingAI Assistant
                         <h3 className="font-bold text-lg">{m.filename}</h3>
                         <p className="text-xs text-slate-500">{format(parseISO(m.created_at), 'PPP p')}</p>
                       </div>
+                      <button 
+                        onClick={() => deleteMeeting(m.id)}
+                        className="p-2 text-slate-400 hover:text-red-500 transition-colors"
+                        title="Delete Meeting"
+                      >
+                        <Trash2 size={18} />
+                      </button>
                     </div>
                     <div className="space-y-4">
                       <div>
@@ -761,9 +903,9 @@ MeetingAI Assistant
               "p-6 rounded-2xl border",
               isDarkMode ? "bg-zinc-900/50 border-white/10" : "bg-white border-black/5 shadow-sm"
             )}>
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Upload size={20} className="text-indigo-500" />
-                Upload Meeting Audio
+                Upload Meeting Audio or Video
               </h2>
               
               <div 
@@ -785,28 +927,28 @@ MeetingAI Assistant
                   ref={fileInputRef}
                   onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
                   className="hidden" 
-                  accept="audio/*"
+                  accept="audio/*,video/*"
                 />
                 <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/20 flex items-center justify-center text-indigo-600">
                   {isProcessing ? <Loader2 className="animate-spin" /> : <Upload size={24} />}
                 </div>
                 <div className="text-center">
-                  <p className="font-medium">Click or drag audio file</p>
-                  <p className="text-xs text-slate-500 mt-1">MP3, WAV, M4A up to 25MB</p>
+                  <p className="font-medium">Click or drag audio/video file</p>
+                  <p className="text-xs text-slate-500 mt-1">MP3, WAV, MP4, MOV up to 100MB</p>
                 </div>
               </div>
 
               {isProcessing && (
                 <div className="mt-4 space-y-2">
                   <div className="flex justify-between text-xs font-medium">
-                    <span>AI is processing...</span>
+                    <span>{processingStatus || 'AI is processing...'}</span>
                     <span>Transcribing & Extracting</span>
                   </div>
                   <div className="h-1.5 w-full bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
                     <motion.div 
                       initial={{ width: 0 }}
                       animate={{ width: "100%" }}
-                      transition={{ duration: 15, ease: "linear" }}
+                      transition={{ duration: 20, ease: "linear" }}
                       className="h-full bg-indigo-500"
                     />
                   </div>
@@ -1000,17 +1142,25 @@ MeetingAI Assistant
                                 )}
                               </div>
                             </div>
-                            {task.assigned_to !== 'Unknown' && (
-                              <button 
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleSendReminder(task);
-                                }}
-                                className="text-[10px] font-bold text-indigo-500 hover:underline uppercase"
-                              >
-                                Send Reminder
-                              </button>
-                            )}
+                            <div className="flex flex-col items-end gap-1">
+                              {task.assigned_to !== 'Unknown' && (
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleSendReminder(task);
+                                  }}
+                                  className="text-[10px] font-bold text-indigo-500 hover:underline uppercase"
+                                >
+                                  Send Reminder
+                                </button>
+                              )}
+                              {task.auto_alert_enabled === 1 && (
+                                <div className="flex items-center gap-1 text-[9px] font-bold text-indigo-500 bg-indigo-500/10 px-2 py-0.5 rounded-full">
+                                  <Bell size={10} />
+                                  SCHEDULED
+                                </div>
+                              )}
+                            </div>
                           </div>
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
@@ -1374,6 +1524,52 @@ MeetingAI Assistant
                   className="flex-1 py-3 rounded-xl bg-red-600 text-white font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-500/20"
                 >
                   Clear All
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Clear All History Confirmation Modal */}
+      <AnimatePresence>
+        {showHistoryClearConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowHistoryClearConfirm(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className={cn(
+                "relative w-full max-w-sm p-6 rounded-3xl border shadow-2xl text-center",
+                isDarkMode ? "bg-zinc-900 border-white/10" : "bg-white border-black/5"
+              )}
+            >
+              <div className="w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center text-red-600 dark:text-red-400 mx-auto mb-4">
+                <Trash2 size={32} />
+              </div>
+              <h2 className="text-xl font-bold mb-2">Clear All History?</h2>
+              <p className="text-slate-500 text-sm mb-6">
+                This will permanently delete all meeting history and their associated tasks. This action cannot be undone.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowHistoryClearConfirm(false)}
+                  className="flex-1 py-3 rounded-xl bg-slate-100 dark:bg-zinc-800 font-bold hover:bg-slate-200 dark:hover:bg-zinc-700 transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={clearAllMeetings}
+                  className="flex-1 py-3 rounded-xl bg-red-600 text-white font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-500/20"
+                >
+                  Clear History
                 </button>
               </div>
             </motion.div>

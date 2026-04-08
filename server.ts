@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import cron from 'node-cron';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,6 +14,12 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  // Ensure uploads directory exists
+  const uploadsDir = path.join(process.cwd(), 'uploads');
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
 
   // Database setup
   const db = new Database('meeting_assistant.db');
@@ -98,18 +105,31 @@ async function startServer() {
       cb(null, Date.now() + '-' + file.originalname);
     }
   });
-  const upload = multer({ storage });
+  const upload = multer({ 
+    storage,
+    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+  });
 
   // API Routes
-  app.post('/api/upload', upload.single('audio'), (req, res) => {
-    const file = req.file as Express.Multer.File;
-    if (!file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-    res.json({ 
-      message: 'File uploaded successfully', 
-      filename: file.filename,
-      path: file.path 
+  app.post('/api/upload', (req, res) => {
+    upload.single('audio')(req, res, (err) => {
+      if (err) {
+        console.error('Multer error:', err);
+        if (err instanceof multer.MulterError) {
+          return res.status(400).json({ error: `Upload error: ${err.message}` });
+        }
+        return res.status(500).json({ error: `Server error during upload: ${err.message}` });
+      }
+
+      const file = req.file as Express.Multer.File;
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+      res.json({ 
+        message: 'File uploaded successfully', 
+        filename: file.filename,
+        path: file.path 
+      });
     });
   });
 
@@ -129,6 +149,23 @@ async function startServer() {
   app.get('/api/meetings/latest', (req, res) => {
     const meeting = db.prepare('SELECT * FROM meetings ORDER BY created_at DESC LIMIT 1').get();
     res.json(meeting || null);
+  });
+
+  app.delete('/api/meetings/:id', (req, res) => {
+    const { id } = req.params;
+    db.transaction(() => {
+      db.prepare('DELETE FROM tasks WHERE meeting_id = ?').run(id);
+      db.prepare('DELETE FROM meetings WHERE id = ?').run(id);
+    })();
+    res.json({ success: true });
+  });
+
+  app.delete('/api/meetings', (req, res) => {
+    db.transaction(() => {
+      db.prepare('DELETE FROM tasks').run();
+      db.prepare('DELETE FROM meetings').run();
+    })();
+    res.json({ success: true });
   });
 
   app.get('/api/tasks', (req, res) => {
